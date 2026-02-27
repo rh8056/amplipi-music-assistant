@@ -1,0 +1,40 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "AmpliPi Music Assistant",
+        "description": "Connect to your AmpliPi host and configure playback options.",
+        "data": {
+          "host": "Host",
+          "auto_zones": "Auto-discover all zones",
+          "zone_id": "Single zone ID (when auto_zones is off)",
+          "source_id": "Preferred fallback source ID",
+          "play_vol_f": "Play volume (0.0 - 1.0)",
+          "debug_logs": "Enable debug logs"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot connect to AmpliPi host",
+      "invalid_zone_id": "Zone ID must be 0 or greater when auto-discover is disabled",
+      "invalid_source_id": "Source ID must be 1 or greater"
+    },
+    "abort": {
+      "already_configured": "This AmpliPi host is already configured"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "AmpliPi Music Assistant options",
+        "data": {
+          "auto_zones": "Auto-discover all zones",
+          "zone_id": "Single zone ID (when auto_zones is off)",
+          "source_id": "Preferred fallback source ID",
+          "play_vol_f": "Play volume (0.0 - 1.0)",
+          "debug_logs": "Enable debug logs"
+        }
+      }
+    }
+  }
+}
