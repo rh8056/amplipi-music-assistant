@@ -473,8 +473,12 @@ class AmpliPiPlayer(Player):
             member = self.mass.players.get(player_id)
             if isinstance(member, AmpliPiPlayer):
                 member._sync_leader = None
-                # Do not force source_id=-1 on ungroup; that can stop the wrong zone
-                # when MA triggers ungroup from a child/edge flow.
+                # Explicit ungroup from this leader: detach the member from this source
+                # so AmpliPi no longer keeps that zone on shared playback.
+                await member._set_zone({"mute": True})
+                await asyncio.sleep(0.1)
+                await member._set_zone({"source_id": -1})
+                member._attr_playback_state = PlaybackState.IDLE
                 member.update_state()
             if player_id in self._attr_group_members:
                 self._attr_group_members.remove(player_id)
