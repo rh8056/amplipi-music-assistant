@@ -1,0 +1,10 @@
+{
+  "type": "player",
+  "domain": "amplipi",
+  "name": "AmpliPi",
+  "description": "Native Music Assistant player provider for AmpliPi zones.",
+  "stage": "alpha",
+  "codeowners": ["@rh8056"],
+  "requirements": [],
+  "documentation": "https://github.com/rh8056/amplipi-music-assistant"
+}
