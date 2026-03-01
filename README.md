@@ -1,104 +1,69 @@
-# AmpliPi Test Home Assistant Integration
+# AmpliPi + Music Assistant (Beginner Guide)
 
-Minimal custom `media_player` platform for testing AmpliPi zones in Home Assistant and exposing them to Music Assistant via the Home Assistant players provider.
+This project lets **Music Assistant** control your **AmpliPi zones directly**.
 
-Now supports Home Assistant **config-entry (UI) setup** with options editing and integration reload.
-
-## Features
-
-- Auto-discover all AmpliPi zones (`auto_zones: true`)
-- One HA `media_player` per AmpliPi zone
-- Play media via `POST /api/play`
-- Transport control via `POST /api/streams/{sid}/{cmd}` (`play`, `pause`, `stop`)
-- Dynamic source selection (reuse current source, else first idle source, else fallback source)
-- 1-second polling for quick state sync
-- Zone/source/stream diagnostics in entity attributes
-- Zone-name-based entity IDs and friendly names
-- Optional concise debug logs (`debug_logs: true`)
-
-## Configuration (recommended: UI config-entry)
-
-1. Go to **Settings → Devices & Services → Add Integration**
-2. Search for **AmpliPi Test**
-3. Enter host/options:
-   - `host`
-   - `auto_zones`
-   - `zone_id` (used when `auto_zones: false`)
-   - `source_id` fallback
-   - `play_vol_f`
-   - `debug_logs`
-
-After setup, use **Configure** on the integration to adjust options and **Reload** to apply without full core restart.
-
-YAML setup is no longer supported.
-
-## Entity attributes
-
-Useful diagnostics in Developer Tools → States:
-
-- `zone_id`
-- `source_id`, `source_name`, `source_input`, `source_state`
-- `stream_id`, `stream_name`, `stream_type`
-- `source_supported_cmds`, `stream_supported_cmds`
-- `disabled`
-
-## Notes / Known behavior
-
-- Config-entry setup is preferred for faster reload/test loops.
-- Python code changes may still require HA restart depending on module reload behavior.
-- Existing entity registry customizations can override friendly names.
-- If names/IDs don’t update as expected, remove old entities and restart.
-- This is a testing bridge; long-term ideal architecture is a native Music Assistant provider for full queue/session modeling of AmpliPi source limits.
-
-## Troubleshooting
-
-1. Set `debug_logs: true`
-2. Restart HA core
-3. Check logs for concise events (selected source, stream id, command success/fallback)
+If you are not a Python or Docker developer, that is okay — this README is written as a step-by-step setup guide.
 
 ---
 
-## Music Assistant native provider (experimental scaffold)
+## 1) What this project includes
 
-This repository now also includes an initial Music Assistant player-provider scaffold:
+There are two parts in this repo:
 
-- `ma_provider/amplipi/manifest.json`
-- `ma_provider/amplipi/__init__.py`
-- `ma_provider/amplipi/constants.py`
-- `ma_provider/amplipi/provider.py`
-- `ma_provider/amplipi/player.py`
+1. **Music Assistant provider** (recommended)
+   - Path: `ma_provider/amplipi`
+   - This is the main thing you should use.
 
-### What it currently does
+2. **Home Assistant custom integration** (optional)
+   - Path: `custom_components/amplipi_music_assistant`
+   - Only use this if you specifically want AmpliPi entities in Home Assistant.
 
-- Registers an AmpliPi player provider for MA v2.3-style APIs
-- Discovers zones from `/api`
-- Creates one MA player per zone
-- Supports core controls (`play_media`, `play`, `pause`, `stop`, power, volume)
-- Uses stream transport commands and source selection/fallback logic similar to HA integration
+If you already use the official **Music Assistant integration in Home Assistant** and you are using
+the native AmpliPi provider in Music Assistant, you do **not** need to also install/use the
+`amplipi_music_assistant` custom integration.
 
-### Important
+In short:
+- Use native MA provider for AmpliPi control (recommended)
+- Use HA custom integration only for HA-specific dashboards/automations
 
-This is a **starting scaffold**, not a fully production-hardened MA provider yet.
-You’ll likely still want to add:
+If your goal is just “make MA control AmpliPi reliably,” use the **Music Assistant provider**.
 
-- richer error handling/reporting
-- full sync-group semantics
-- queue metadata/state nuances and long-run soak testing
+---
 
-### Installing in Music Assistant (development)
+## 2) Quick glossary (plain English)
 
-1. Copy `ma_provider/amplipi` into your MA Server providers path (or local custom provider path in your MA dev setup).
-2. Restart MA Server.
-3. Add/configure provider instance in MA UI with host/options.
-4. Verify discovered players and test transport/volume commands.
+- **Zone** = a room output (Office, Kitchen, etc.)
+- **Source** = AmpliPi input channel feeding a zone
+- **Group** = multiple zones sharing the same source
+- **Power Off in MA (this provider)** = mute + detach source (does **not** disable the zone)
+- **Power On in MA (this provider)** = attach source + unmute
 
-### Docker install/upgrade notes (important)
+---
 
-For MA `2.7.x` (including `2.7.9`), provider discovery in server runtime scans the internal
-`music_assistant/providers` path. If you run MA in Docker and want this custom provider to survive upgrades,
-bind-mount the provider folder to the in-container providers path.
+## 3) Before you start
 
-Example compose snippet:
+You should already have:
+
+- Music Assistant running in Docker
+- AmpliPi reachable on your network
+- Your AmpliPi IP/hostname
+- Terminal access to your Docker host
+
+---
+
+## 4) Install the Music Assistant provider (Docker)
+
+### Step A: Put provider files on host
+
+Copy `ma_provider/amplipi` from this repo to your Docker host, for example:
+
+- `/opt/music-assistant/providers/amplipi`
+
+### Step B: Mount provider into MA container
+
+If you already have a compose file, add this volume under `music-assistant`.
+
+If you want a complete starter compose file, use this template:
 
 ```yaml
 services:
@@ -107,23 +72,201 @@ services:
     container_name: music-assistant
     restart: unless-stopped
     network_mode: host
+    environment:
+      - TZ=America/Los_Angeles
     volumes:
       - /opt/music-assistant/data:/data
       - /opt/music-assistant/providers/amplipi:/app/venv/lib/python3.13/site-packages/music_assistant/providers/amplipi
 ```
 
-> Note: the Python minor version in the path (`python3.13`) may change on future MA images.
-> After upgrades, verify and adjust the mount target if needed.
+If you only need the mount line, here it is:
 
-#### Post-upgrade verification
+```yaml
+volumes:
+  - /opt/music-assistant/data:/data
+  - /opt/music-assistant/providers/amplipi:/app/venv/lib/python3.13/site-packages/music_assistant/providers/amplipi
+```
+
+> Important: The `python3.13` part may change on future MA images.
+
+To find the exact provider path in your own running container, use:
 
 ```bash
-docker exec music-assistant sh -c 'ls -la /app/venv/lib/python3.13/site-packages/music_assistant/providers/amplipi'
+docker exec music-assistant python3 -c "import music_assistant, os; print(os.path.join(os.path.dirname(music_assistant.__file__), 'providers'))"
+```
+
+Use the printed path on the right-hand side of your bind mount.
+
+### Step C: Restart MA
+
+```bash
+docker compose down
+docker compose up -d
+```
+
+### Step D: Confirm provider is loaded
+
+```bash
 docker logs --tail=300 music-assistant | grep -Ei 'Loaded player provider AmpliPi|Initializing AmpliPi provider|amplipi'
 ```
 
-#### Behavior checklist (current provider)
+You should see AmpliPi provider startup lines.
 
-- grouped playback keeps members attached to leader source (self-heal path)
-- syncgroup power-off/stop triggers mute-then-detach for all attached zones
-- queue skip/seek should not repeatedly reset volume from `play_vol_f`
+---
+
+## 5) Add provider in Music Assistant UI
+
+1. Open Music Assistant UI
+2. Go to **Providers**
+3. Click **Add Provider**
+4. Select **AmpliPi**
+5. Enter host and options
+
+You should then see one MA player per AmpliPi zone.
+
+---
+
+## 6) Settings explained simply
+
+### `source_id` fallback
+
+This is the backup source MA uses when it cannot choose a better source automatically.
+
+Default is **`0`** (AmpliPi Input 1 / Source 1).
+
+Why this default:
+- On many AmpliPi installs, Source 1 (`source_id: 0`) is the most capable input path.
+- Some higher bitrate/sample-rate content support is better on Source 1 than other sources.
+- Using Source 1 first helps avoid playback limitation surprises.
+
+Used for:
+- Power On (if no previous source is known)
+- New grouped playback when no safe source is found
+
+Current source pick order is:
+1. Reuse current source if safe
+2. Prefer configured fallback source (default `0`) if safe
+3. Then try idle/non-conflicting alternatives
+
+### `play_vol_f`
+
+Startup play volume (0.0 to 1.0).
+
+Good starting value: `0.2` to `0.35`.
+
+### `debug_logs`
+
+Turn this on only when troubleshooting.
+
+---
+
+## 7) What to expect in daily use
+
+### Start playback on one zone
+
+MA selects a source and starts playback.
+
+### Add a zone to group
+
+The added zone is attached to leader source and unmuted.
+
+### Remove a zone from group
+
+Removed zone is:
+1. muted
+2. detached from source
+
+### Power Off a zone/group
+
+Zones are:
+1. muted
+2. detached from source
+
+No zone is disabled by MA.
+
+### Power On a zone
+
+Zone is:
+1. attached to source (last used or fallback)
+2. unmuted
+
+If stream is not currently playing, press Play.
+
+---
+
+## 8) Upgrade checklist (important)
+
+When upgrading Music Assistant Docker image:
+
+1. Pull latest image and restart MA:
+
+```bash
+docker compose pull music-assistant
+docker compose up -d
+```
+
+2. Re-check provider mount path (python version may have changed)
+3. Verify provider logs
+
+Quick check:
+
+```bash
+docker exec music-assistant sh -c 'ls -la /app/venv/lib/python3.13/site-packages/music_assistant/providers/amplipi'
+```
+
+If folder is missing inside container, MA will not show provider in UI.
+
+---
+
+## 9) Common problems and fixes
+
+### Problem: Provider not visible in MA
+
+Likely cause: wrong Docker mount path.
+
+Fix:
+- verify mount target in compose
+- restart container
+- re-check logs
+
+### Problem: Power On never appears in MA
+
+Likely cause: provider reports player as always powered.
+
+Fix:
+- update to latest provider in this repo
+- restart MA
+
+### Problem: Zone stays on stream after ungroup
+
+Fix:
+- update to latest provider
+- removed member should mute then detach
+
+### Problem: Provider disappeared after upgrade
+
+Likely cause: Python minor version path changed in container.
+
+Fix:
+- update mount target path
+- restart MA
+
+---
+
+## 10) Optional Home Assistant integration
+
+If you want HA-side entities too, there is an optional custom integration at:
+
+- `custom_components/amplipi_music_assistant`
+
+Integration display name:
+- **AmpliPi Music Assistant**
+
+Entity ID style:
+- `media_player.amplipi_ma_<zone_name>`
+
+If you do not need HA entities, you can skip this completely.
+
+If you are already running the official Music Assistant integration in Home Assistant and your
+AmpliPi zones are controlled through native MA provider, this optional integration is usually
+not needed.
