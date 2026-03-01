@@ -7,6 +7,7 @@ import re
 import time
 from typing import TYPE_CHECKING, Any
 
+from music_assistant_models.player import DeviceInfo
 from music_assistant_models.enums import PlaybackState, PlayerFeature, PlayerType
 
 from music_assistant.models.player import Player, PlayerMedia
@@ -28,6 +29,7 @@ class AmpliPiPlayer(Player):
         preferred_source_id: int,
         play_vol_f: float,
         debug_logs: bool,
+        firmware_version: str | None = None,
     ) -> None:
         super().__init__(provider, player_id)
         self.host = host
@@ -36,6 +38,7 @@ class AmpliPiPlayer(Player):
         self.preferred_source_id = preferred_source_id
         self.play_vol_f = play_vol_f
         self.debug_logs = debug_logs
+        self.firmware_version = firmware_version
 
         self.last_source_id: int = -1
         self.last_stream_id: int = -1
@@ -48,6 +51,12 @@ class AmpliPiPlayer(Player):
 
         self._attr_name = zone_name
         self._attr_type = PlayerType.PLAYER
+        self._attr_device_info = DeviceInfo(
+            model="AmpliPro",
+            manufacturer="MicroNova",
+            software_version=firmware_version,
+            ip_address=host,
+        )
         self._attr_available = True
         self._attr_powered = True
         self._attr_supported_features = {
@@ -159,6 +168,11 @@ class AmpliPiPlayer(Player):
         if self.last_source_id >= 0 and self.last_source_id not in external_source_ids:
             return self.last_source_id
 
+        # Prefer configured fallback first (commonly source_id=0 for best codec/bitrate support)
+        # when it is not feeding external zones.
+        if self.preferred_source_id >= 0 and self.preferred_source_id not in external_source_ids:
+            return self.preferred_source_id
+
         # Prefer an idle source that is not currently used by external zones.
         for src in sources:
             sid = int(src.get("id", -1))
@@ -186,6 +200,11 @@ class AmpliPiPlayer(Player):
             self._attr_available = False
             self.update_state()
             return
+
+        if self.firmware_version is None:
+            self.firmware_version = self.provider._extract_firmware_version(data)
+            if self.firmware_version and self._attr_device_info:
+                self._attr_device_info.software_version = self.firmware_version
 
         self._attr_available = True
         self._attr_volume_muted = bool(zone.get("mute", False))

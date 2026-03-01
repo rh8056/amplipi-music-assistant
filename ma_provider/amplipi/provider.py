@@ -29,6 +29,35 @@ if TYPE_CHECKING:
 class AmpliPiPlayerProvider(PlayerProvider):
     """AmpliPi player provider."""
 
+    @staticmethod
+    def _extract_firmware_version(api_data: dict) -> str | None:
+        """Best-effort extraction of firmware version from AmpliPi /api payload."""
+        info = api_data.get("info") or {}
+        fw_entries = info.get("fw") or []
+        fw_version = None
+        if isinstance(fw_entries, list) and fw_entries:
+            first_fw = fw_entries[0] or {}
+            fw_val = first_fw.get("version") if isinstance(first_fw, dict) else None
+            if fw_val is not None and str(fw_val).strip():
+                fw_version = str(fw_val).strip()
+
+        candidates = (
+            api_data.get("version"),
+            info.get("version"),
+            info.get("fw_version"),
+            (api_data.get("system") or {}).get("version"),
+            (api_data.get("system") or {}).get("fw_version"),
+        )
+        for value in candidates:
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                if fw_version:
+                    return f"{text} (fw {fw_version})"
+                return text
+        return f"fw {fw_version}" if fw_version else None
+
     async def handle_async_init(self) -> None:
         """Handle async initialization of provider."""
         self.logger.info("Initializing AmpliPi provider")
@@ -52,6 +81,7 @@ class AmpliPiPlayerProvider(PlayerProvider):
 
         data = await self._request(host, "GET", "/api")
         zones = data.get("zones", [])
+        firmware_version = self._extract_firmware_version(data)
 
         if not auto_zones:
             single_zone = cast(int, self.config.get_value(CONF_ZONE_ID, 0))
@@ -71,6 +101,7 @@ class AmpliPiPlayerProvider(PlayerProvider):
                 preferred_source_id=source_id,
                 play_vol_f=play_vol_f,
                 debug_logs=debug_logs,
+                firmware_version=firmware_version,
             )
             existing: MAPlayer | None = self.mass.players.get(player.player_id)
             if existing is None:
