@@ -188,7 +188,6 @@ class AmpliPiPlayer(Player):
             return
 
         self._attr_available = True
-        self._attr_powered = not bool(zone.get("disabled", False))
         self._attr_volume_muted = bool(zone.get("mute", False))
         self._attr_volume_level = int(max(0.0, min(1.0, float(zone.get("vol_f", 0.5)))) * 100)
 
@@ -200,6 +199,10 @@ class AmpliPiPlayer(Player):
             src = next((s for s in sources if int(s.get("id", -1)) == source_id), None)
             source_state = str((src or {}).get("info", {}).get("state", "stopped")).lower()
             source_input = (src or {}).get("input")
+
+        # MA power model: zone is considered powered when attached to an active source.
+        # This keeps Power On/Off UI semantics usable even when we do not set disabled=true.
+        self._attr_powered = source_id >= 0 and not bool(zone.get("disabled", False))
 
         stream_id = self._parse_stream_id(source_input)
         if stream_id >= 0:
@@ -297,7 +300,7 @@ class AmpliPiPlayer(Player):
 
         if powered:
             source = self.last_source_id if self.last_source_id >= 0 else self.preferred_source_id
-            await self._set_zone({"disabled": False, "source_id": source, "mute": False})
+            await self._set_zone({"source_id": source, "mute": False})
             self._attr_powered = True
         else:
             self._log_debug(
@@ -361,10 +364,10 @@ class AmpliPiPlayer(Player):
             )
 
             await asyncio.sleep(0.15)
-            # Detach/disable all targets in parallel.
+            # Detach all targets in parallel (do not disable zones).
             await asyncio.gather(
                 *(
-                    self._set_zone_by_id(zid, {"source_id": -1, "disabled": True})
+                    self._set_zone_by_id(zid, {"source_id": -1})
                     for zid in sorted(target_zone_ids)
                 ),
                 return_exceptions=True,
@@ -382,7 +385,7 @@ class AmpliPiPlayer(Player):
             self._log_debug("power(False) muting/detaching leader zone_id=%s", self.zone_id)
             await self._set_zone({"mute": True})
             await asyncio.sleep(0.15)
-            await self._set_zone({"source_id": -1, "disabled": True})
+            await self._set_zone({"source_id": -1})
             self._attr_volume_muted = True
             self._attr_powered = False
             self._attr_playback_state = PlaybackState.IDLE
@@ -399,7 +402,7 @@ class AmpliPiPlayer(Player):
         self.update_state()
 
     async def play(self) -> None:
-        await self._set_zone({"mute": False, "disabled": False})
+        await self._set_zone({"mute": False})
         await self._play_with_retry()
         self._attr_playback_state = PlaybackState.PLAYING
         self._attr_elapsed_time = 0
@@ -459,7 +462,6 @@ class AmpliPiPlayer(Player):
                 {
                     "source_id": leader_source,
                     "mute": False,
-                    "disabled": False,
                 }
             )
             member._sync_leader = self.player_id
@@ -520,7 +522,7 @@ class AmpliPiPlayer(Player):
             "/api/play",
             play_payload,
         )
-        await self._set_zone({"source_id": selected_source_id, "mute": False, "disabled": False})
+        await self._set_zone({"source_id": selected_source_id, "mute": False})
 
         # Ensure currently grouped members are explicitly attached to the same source.
         for member_id in self._attr_group_members:
@@ -529,7 +531,7 @@ class AmpliPiPlayer(Player):
             member = self.mass.players.get(member_id)
             if not isinstance(member, AmpliPiPlayer):
                 continue
-            await member._set_zone({"source_id": selected_source_id, "mute": False, "disabled": False})
+            await member._set_zone({"source_id": selected_source_id, "mute": False})
             member._sync_leader = self.player_id
             member._attr_powered = True
             member.update_state()
