@@ -9,13 +9,11 @@ from music_assistant_models.enums import ConfigEntryType, ProviderFeature
 
 from .constants import (
     CONF_AUTO_ZONES,
-    CONF_DEBUG_LOGS,
     CONF_HOST,
     CONF_PLAY_VOL_F,
     CONF_SOURCE_ID,
     CONF_ZONE_ID,
     DEFAULT_AUTO_ZONES,
-    DEFAULT_DEBUG_LOGS,
     DEFAULT_PLAY_VOL_F,
     DEFAULT_SOURCE_ID,
 )
@@ -73,8 +71,8 @@ async def get_config_entries(
         ConfigEntry(
             key=CONF_SOURCE_ID,
             type=ConfigEntryType.INTEGER,
-            label="Preferred fallback source ID",
-            required=True,
+            label="Preferred fallback source ID (0-based, Source 1 = 0)",
+            required=False,
             default_value=DEFAULT_SOURCE_ID,
         ),
         ConfigEntry(
@@ -83,12 +81,5 @@ async def get_config_entries(
             label="Play volume fraction",
             required=True,
             default_value=DEFAULT_PLAY_VOL_F,
-        ),
-        ConfigEntry(
-            key=CONF_DEBUG_LOGS,
-            type=ConfigEntryType.BOOLEAN,
-            label="Enable debug logs",
-            required=True,
-            default_value=DEFAULT_DEBUG_LOGS,
         ),
     )

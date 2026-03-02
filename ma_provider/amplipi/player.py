@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import time
 from typing import TYPE_CHECKING, Any
@@ -28,7 +29,6 @@ class AmpliPiPlayer(Player):
         zone_name: str,
         preferred_source_id: int,
         play_vol_f: float,
-        debug_logs: bool,
         firmware_version: str | None = None,
     ) -> None:
         super().__init__(provider, player_id)
@@ -37,7 +37,6 @@ class AmpliPiPlayer(Player):
         self.zone_name = zone_name
         self.preferred_source_id = preferred_source_id
         self.play_vol_f = play_vol_f
-        self.debug_logs = debug_logs
         self.firmware_version = firmware_version
 
         self.last_source_id: int = -1
@@ -75,8 +74,21 @@ class AmpliPiPlayer(Player):
         return self._sync_leader
 
     def _log_debug(self, msg: str, *args: Any) -> None:
-        if self.debug_logs:
+        if self.provider.logger.isEnabledFor(logging.DEBUG):
             self.provider.logger.debug("[zone=%s name=%s] " + msg, self.zone_id, self.zone_name, *args)
+
+    def _log_action(self, action: str, **kwargs: Any) -> None:
+        """Log high-signal action breadcrumbs for playback debugging."""
+        if not self.provider.logger.isEnabledFor(logging.DEBUG):
+            return
+        details = " ".join(f"{k}={v}" for k, v in kwargs.items())
+        self.provider.logger.debug(
+            "[zone=%s name=%s] action=%s %s",
+            self.zone_id,
+            self.zone_name,
+            action,
+            details,
+        )
 
     async def _set_zone_by_id(self, zone_id: int, payload: dict[str, Any]) -> None:
         """Set a zone by numeric id with PATCH->POST fallback."""
@@ -309,6 +321,7 @@ class AmpliPiPlayer(Player):
         - On power-off, mute first, then detach from source.
         - For grouped playback, resolve targets from MA state and live AmpliPi source usage.
         """
+        self._log_action("power", requested=powered, sync_leader=self._sync_leader)
         # If called on a synced child, delegate to leader for coherent group behavior.
         if self._sync_leader:
             leader = self.mass.players.get(self._sync_leader)
@@ -411,16 +424,19 @@ class AmpliPiPlayer(Player):
         self.update_state()
 
     async def volume_set(self, volume_level: int) -> None:
+        self._log_action("volume_set", level=volume_level)
         await self._set_zone({"vol_f": max(0.0, min(1.0, volume_level / 100))})
         self._attr_volume_level = volume_level
         self.update_state()
 
     async def volume_mute(self, muted: bool) -> None:
+        self._log_action("volume_mute", muted=muted)
         await self._set_zone({"mute": bool(muted)})
         self._attr_volume_muted = muted
         self.update_state()
 
     async def play(self) -> None:
+        self._log_action("play", stream_id=self.last_stream_id, source_id=self.last_source_id)
         await self._set_zone({"mute": False})
         await self._play_with_retry()
         self._attr_playback_state = PlaybackState.PLAYING
@@ -430,6 +446,7 @@ class AmpliPiPlayer(Player):
         self._sync_child_states_from_leader()
 
     async def pause(self) -> None:
+        self._log_action("pause", stream_id=self.last_stream_id, source_id=self.last_source_id)
         did_pause = await self._exec_stream_cmd("pause")
         if not did_pause:
             await self._set_zone({"mute": True})
@@ -438,6 +455,7 @@ class AmpliPiPlayer(Player):
         self._sync_child_states_from_leader()
 
     async def stop(self) -> None:
+        self._log_action("stop", stream_id=self.last_stream_id, source_id=self.last_source_id)
         # Syncgroup virtual player power-off often routes as STOP to child players,
         # not POWER(False). Mirror shutdown behavior here so all linked zones detach.
         self._log_debug("stop() invoked; applying group-aware mute+detach behavior")
@@ -459,6 +477,12 @@ class AmpliPiPlayer(Player):
         player_ids_to_remove: list[str] | None = None,
     ) -> None:
         """Group/ungroup players by aligning members to this leader's active source."""
+        self._log_action(
+            "set_members",
+            add=player_ids_to_add or [],
+            remove=player_ids_to_remove or [],
+            leader_source=self.last_source_id,
+        )
         # MA may call SET_MEMBERS on any involved player. If this player is currently
         # a synced child, delegate to leader to avoid split-brain group state.
         if self._sync_leader:
@@ -512,6 +536,7 @@ class AmpliPiPlayer(Player):
 
     async def play_media(self, media: PlayerMedia) -> None:
         """Play media URL/path on selected AmpliPi source."""
+        self._log_action("play_media_start", uri=media.uri, sync_leader=self._sync_leader)
         # If play is invoked on a synced child, route to leader so grouped zones
         # are handled coherently.
         if self._sync_leader:
@@ -526,6 +551,12 @@ class AmpliPiPlayer(Player):
         selected_source_id = self._select_source_for_play(
             data.get("sources", []),
             data.get("zones", []),
+        )
+        self._log_action(
+            "play_media_source_selected",
+            selected_source_id=selected_source_id,
+            current_zone_source=current_zone_source,
+            preferred_source_id=self.preferred_source_id,
         )
         play_payload = {
             "media": media.uri,

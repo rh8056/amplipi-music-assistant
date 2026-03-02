@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, cast
 
 import aiohttp
@@ -10,13 +11,11 @@ from music_assistant.models.player_provider import PlayerProvider
 
 from .constants import (
     CONF_AUTO_ZONES,
-    CONF_DEBUG_LOGS,
     CONF_HOST,
     CONF_PLAY_VOL_F,
     CONF_SOURCE_ID,
     CONF_ZONE_ID,
     DEFAULT_AUTO_ZONES,
-    DEFAULT_DEBUG_LOGS,
     DEFAULT_PLAY_VOL_F,
     DEFAULT_SOURCE_ID,
 )
@@ -28,6 +27,11 @@ if TYPE_CHECKING:
 
 class AmpliPiPlayerProvider(PlayerProvider):
     """AmpliPi player provider."""
+
+    @property
+    def _debug_enabled(self) -> bool:
+        """Use MA/global logger level as primary debug control."""
+        return self.logger.isEnabledFor(logging.DEBUG)
 
     @staticmethod
     def _extract_firmware_version(api_data: dict) -> str | None:
@@ -77,7 +81,6 @@ class AmpliPiPlayerProvider(PlayerProvider):
         auto_zones = cast(bool, self.config.get_value(CONF_AUTO_ZONES, DEFAULT_AUTO_ZONES))
         source_id = cast(int, self.config.get_value(CONF_SOURCE_ID, DEFAULT_SOURCE_ID))
         play_vol_f = cast(float, self.config.get_value(CONF_PLAY_VOL_F, DEFAULT_PLAY_VOL_F))
-        debug_logs = cast(bool, self.config.get_value(CONF_DEBUG_LOGS, DEFAULT_DEBUG_LOGS))
 
         data = await self._request(host, "GET", "/api")
         zones = data.get("zones", [])
@@ -100,7 +103,6 @@ class AmpliPiPlayerProvider(PlayerProvider):
                 zone_name=zone_name,
                 preferred_source_id=source_id,
                 play_vol_f=play_vol_f,
-                debug_logs=debug_logs,
                 firmware_version=firmware_version,
             )
             existing: MAPlayer | None = self.mass.players.get(player.player_id)
@@ -119,16 +121,31 @@ class AmpliPiPlayerProvider(PlayerProvider):
     ):
         """Issue request to AmpliPi API."""
         url = f"http://{host}{path}"
+        if self._debug_enabled:
+            self.logger.debug("AmpliPi API request: %s %s payload=%s", method, path, payload or {})
         timeout = aiohttp.ClientTimeout(total=8)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            if method == "GET":
-                async with session.get(url) as resp:
-                    resp.raise_for_status()
-                    return await resp.json()
-            if method == "PATCH":
-                async with session.patch(url, json=payload or {}) as resp:
-                    resp.raise_for_status()
-                    return await resp.json()
-            async with session.post(url, json=payload or {}) as resp:
-                resp.raise_for_status()
-                return await resp.json()
+            try:
+                if method == "GET":
+                    async with session.get(url) as resp:
+                        resp.raise_for_status()
+                        data = await resp.json()
+                elif method == "PATCH":
+                    async with session.patch(url, json=payload or {}) as resp:
+                        resp.raise_for_status()
+                        data = await resp.json()
+                else:
+                    async with session.post(url, json=payload or {}) as resp:
+                        resp.raise_for_status()
+                        data = await resp.json()
+            except Exception as err:
+                if self._debug_enabled:
+                    self.logger.debug("AmpliPi API error: %s %s err=%s", method, path, err)
+                raise
+
+        if self._debug_enabled:
+            if isinstance(data, dict):
+                self.logger.debug("AmpliPi API response: %s %s keys=%s", method, path, sorted(data.keys()))
+            else:
+                self.logger.debug("AmpliPi API response: %s %s type=%s", method, path, type(data).__name__)
+        return data
