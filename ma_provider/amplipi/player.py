@@ -42,6 +42,12 @@ class AmpliPiPlayer(Player):
         self.last_source_id: int = -1
         self.last_stream_id: int = -1
         self.last_stream_supported_cmds: list[str] = []
+        self._last_play_cmd_ts: float = 0.0
+        self._last_play_media_start_ts: float = 0.0
+        self._last_pause_cmd_ts: float = 0.0
+        self._replay_guard_started_ts: float = 0.0
+        self._replay_guard_media_uri: str | None = None
+        self._last_media_uri: str | None = None
         self._sync_leader: str | None = None
 
         # group model: leader has group_members list including itself, followers have synced_to.
@@ -113,6 +119,38 @@ class AmpliPiPlayer(Player):
             return -1
         match = re.search(r"stream=(\d+)", source_input)
         return int(match.group(1)) if match else -1
+
+    def _current_media_uri(self) -> str | None:
+        """Return current media URI when known."""
+        media = self._attr_current_media
+        if media is not None:
+            return getattr(media, "uri", None)
+        return self._last_media_uri
+
+    def _queue_tail_reached(self) -> bool:
+        """Best-effort signal that current queue item is at/near end and no next item exists."""
+        try:
+            queue = self.mass.player_queues.get(self.player_id)
+        except Exception:  # noqa: BLE001
+            return False
+        if not queue:
+            return False
+
+        next_item = getattr(queue, "next_item", None)
+        current_item = getattr(queue, "current_item", None)
+        if next_item is not None or current_item is None:
+            return False
+
+        try:
+            elapsed = float(getattr(queue, "elapsed_time", 0) or 0)
+            duration = float(getattr(current_item, "duration", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        if duration <= 0:
+            return False
+
+        # tolerate small timing jitter at track tail
+        return elapsed >= (duration - 1.0)
 
     async def _set_zone(self, payload: dict[str, Any]) -> None:
         """Patch zone values with fallback to POST."""
@@ -252,6 +290,8 @@ class AmpliPiPlayer(Player):
         if previous_stream_id != stream_id:
             self._attr_elapsed_time = 0
             self._attr_elapsed_time_last_updated = time.time()
+            # New underlying stream context means prior track metadata/progress is stale.
+            self._attr_current_media = None
 
         if not self._attr_powered:
             self._attr_playback_state = PlaybackState.IDLE
@@ -278,6 +318,99 @@ class AmpliPiPlayer(Player):
                 self._attr_elapsed_time_last_updated = now
         else:
             self._attr_elapsed_time_last_updated = now
+
+        # Replay guard:
+        # Arm only when queue tail is reached (not generic attached-idle),
+        # then detach if same URI comes back/stays after grace period.
+        current_media_uri = self._current_media_uri()
+        tail_reached = self._queue_tail_reached()
+        if (
+            source_id >= 0
+            and current_media_uri
+            and tail_reached
+            and self._replay_guard_started_ts == 0.0
+        ):
+            self._replay_guard_started_ts = now
+            self._replay_guard_media_uri = current_media_uri
+            self._log_debug(
+                "replay_guard armed media_uri=%s reason=queue_tail",
+                current_media_uri,
+            )
+            # In your environment, queue-tail arm consistently occurs after replay starts.
+            # Stop immediately to avoid replaying the same track.
+            if (now - self._last_pause_cmd_ts) > 75.0:
+                self._log_debug(
+                    "replay_guard immediate detach on arm media_uri=%s",
+                    current_media_uri,
+                )
+                if self.last_stream_id >= 0:
+                    await self.provider._request(
+                        self.host,
+                        "DELETE",
+                        f"/api/streams/{self.last_stream_id}",
+                    )
+                await self._set_zone({"mute": True})
+                await self._set_zone({"source_id": -1})
+                self._attr_powered = False
+                self._attr_playback_state = PlaybackState.IDLE
+                self._attr_elapsed_time = 0
+                self._attr_elapsed_time_last_updated = now
+                self._attr_current_media = None
+                self._replay_guard_started_ts = 0.0
+                self._replay_guard_media_uri = None
+                self.update_state()
+                return
+
+        if self._replay_guard_started_ts > 0.0:
+            # cancel guard on natural state changes
+            if source_id < 0 or not current_media_uri or current_media_uri != self._replay_guard_media_uri:
+                self._replay_guard_started_ts = 0.0
+                self._replay_guard_media_uri = None
+            # If replay already restarted on the same URI after guard matured,
+            # stop it immediately instead of waiting extra time.
+            elif (
+                self._attr_playback_state == PlaybackState.PLAYING
+                and (now - self._replay_guard_started_ts) >= 25.0
+                and (now - self._last_pause_cmd_ts) > 75.0
+            ):
+                self._log_debug(
+                    "replay_guard immediate detach on replay media_uri=%s age=%.1fs",
+                    self._replay_guard_media_uri,
+                    now - self._replay_guard_started_ts,
+                )
+                if self.last_stream_id >= 0:
+                    await self.provider._request(
+                        self.host,
+                        "DELETE",
+                        f"/api/streams/{self.last_stream_id}",
+                    )
+                await self._set_zone({"mute": True})
+                await self._set_zone({"source_id": -1})
+                self._attr_powered = False
+                self._attr_playback_state = PlaybackState.IDLE
+                self._attr_elapsed_time = 0
+                self._attr_elapsed_time_last_updated = now
+                self._attr_current_media = None
+                self._replay_guard_started_ts = 0.0
+                self._replay_guard_media_uri = None
+                self.update_state()
+                return
+            elif (now - self._replay_guard_started_ts) >= 30.0 and (now - self._last_pause_cmd_ts) > 75.0:
+                self._log_debug(
+                    "replay_guard detach media_uri=%s age=%.1fs",
+                    self._replay_guard_media_uri,
+                    now - self._replay_guard_started_ts,
+                )
+                await self._set_zone({"source_id": -1})
+                self._attr_powered = False
+                self._attr_playback_state = PlaybackState.IDLE
+                self._attr_elapsed_time = 0
+                self._attr_elapsed_time_last_updated = now
+                self._attr_current_media = None
+                self._replay_guard_started_ts = 0.0
+                self._replay_guard_media_uri = None
+                self.update_state()
+                return
 
         # Keep grouped follower UI in MA aligned with leader state/media.
         if self._sync_leader:
@@ -331,9 +464,42 @@ class AmpliPiPlayer(Player):
             return
 
         if powered:
-            source = self.last_source_id if self.last_source_id >= 0 else self.preferred_source_id
-            await self._set_zone({"source_id": source, "mute": False})
-            self._attr_powered = True
+            # Power-on should not implicitly join an already playing source used by other zones.
+            data = await self.provider._request(self.host, "GET", "/api")
+            zones = data.get("zones", [])
+            sources = data.get("sources", [])
+            external_source_ids: set[int] = {
+                int(z.get("source_id", -1))
+                for z in zones
+                if int(z.get("id", -1)) != self.zone_id and int(z.get("source_id", -1)) >= 0
+            }
+
+            source = -1
+            if self.last_source_id >= 0 and self.last_source_id not in external_source_ids:
+                source = self.last_source_id
+            elif self.preferred_source_id >= 0 and self.preferred_source_id not in external_source_ids:
+                source = self.preferred_source_id
+            else:
+                for src in sources:
+                    sid = int(src.get("id", -1))
+                    state = str((src.get("info") or {}).get("state", "")).lower()
+                    if sid >= 0 and sid not in external_source_ids and state in {"stopped", "idle", "none"}:
+                        source = sid
+                        break
+                if source < 0:
+                    for src in sources:
+                        sid = int(src.get("id", -1))
+                        if sid >= 0 and sid not in external_source_ids:
+                            source = sid
+                            break
+
+            if source >= 0:
+                await self._set_zone({"source_id": source, "mute": False})
+                self._attr_powered = True
+            else:
+                # No safe source available without joining other active zones.
+                self._log_debug("power(True): no free source available; refusing auto-join")
+                self._attr_powered = False
         else:
             self._log_debug(
                 "power(False) start: last_source_id=%s explicit_group_members=%s",
@@ -421,6 +587,9 @@ class AmpliPiPlayer(Player):
             self._attr_volume_muted = True
             self._attr_powered = False
             self._attr_playback_state = PlaybackState.IDLE
+            self._attr_elapsed_time = 0
+            self._attr_elapsed_time_last_updated = time.time()
+            self._attr_current_media = None
         self.update_state()
 
     async def volume_set(self, volume_level: int) -> None:
@@ -436,17 +605,36 @@ class AmpliPiPlayer(Player):
         self.update_state()
 
     async def play(self) -> None:
+        now = time.time()
+        # Debounce duplicate play requests: MA may issue rapid repeat PLAY calls
+        # while state converges, which can cause stream reconnect/log spam.
+        if (
+            self._attr_playback_state == PlaybackState.PLAYING
+            and not self._attr_volume_muted
+            and (now - self._last_play_cmd_ts) < 2.0
+        ):
+            self._log_debug("skip duplicate play within debounce window")
+            return
+
+        self._last_play_cmd_ts = now
         self._log_action("play", stream_id=self.last_stream_id, source_id=self.last_source_id)
+        prev_state = self._attr_playback_state
+        prev_elapsed = float(self._attr_elapsed_time or 0)
         await self._set_zone({"mute": False})
         await self._play_with_retry()
         self._attr_playback_state = PlaybackState.PLAYING
-        self._attr_elapsed_time = 0
+        # On resume-from-pause, preserve elapsed position for UI continuity.
+        if prev_state in (PlaybackState.PAUSED, PlaybackState.PLAYING) and prev_elapsed > 0:
+            self._attr_elapsed_time = prev_elapsed
+        else:
+            self._attr_elapsed_time = 0
         self._attr_elapsed_time_last_updated = time.time()
         self.update_state()
         self._sync_child_states_from_leader()
 
     async def pause(self) -> None:
         self._log_action("pause", stream_id=self.last_stream_id, source_id=self.last_source_id)
+        self._last_pause_cmd_ts = time.time()
         did_pause = await self._exec_stream_cmd("pause")
         if not did_pause:
             await self._set_zone({"mute": True})
@@ -456,6 +644,17 @@ class AmpliPiPlayer(Player):
 
     async def stop(self) -> None:
         self._log_action("stop", stream_id=self.last_stream_id, source_id=self.last_source_id)
+        # If MA sends STOP shortly after PAUSE (e.g., idle timeout behavior),
+        # keep the zone paused and attached instead of hard power-off/detach.
+        if (
+            self._attr_playback_state == PlaybackState.PAUSED
+            and (time.time() - self._last_pause_cmd_ts) < 60.0
+        ):
+            self._log_debug("stop() ignored due to recent pause grace window")
+            self.update_state()
+            self._sync_child_states_from_leader()
+            return
+
         # Syncgroup virtual player power-off often routes as STOP to child players,
         # not POWER(False). Mirror shutdown behavior here so all linked zones detach.
         self._log_debug("stop() invoked; applying group-aware mute+detach behavior")
@@ -468,6 +667,9 @@ class AmpliPiPlayer(Player):
         await self._exec_stream_cmd("stop")
         await self._set_zone({"source_id": -1})
         self._attr_playback_state = PlaybackState.IDLE
+        self._attr_elapsed_time = 0
+        self._attr_elapsed_time_last_updated = time.time()
+        self._attr_current_media = None
         self.update_state()
         self._sync_child_states_from_leader()
 
@@ -537,6 +739,10 @@ class AmpliPiPlayer(Player):
     async def play_media(self, media: PlayerMedia) -> None:
         """Play media URL/path on selected AmpliPi source."""
         self._log_action("play_media_start", uri=media.uri, sync_leader=self._sync_leader)
+        self._last_play_media_start_ts = time.time()
+        self._replay_guard_started_ts = 0.0
+        self._replay_guard_media_uri = None
+        self._last_media_uri = media.uri
         # If play is invoked on a synced child, route to leader so grouped zones
         # are handled coherently.
         if self._sync_leader:
@@ -587,6 +793,7 @@ class AmpliPiPlayer(Player):
             member.update_state()
 
         await self._play_with_retry()
+        self._last_play_cmd_ts = time.time()
         self._attr_current_media = media
         self._attr_playback_state = PlaybackState.PLAYING
         self._attr_elapsed_time = 0

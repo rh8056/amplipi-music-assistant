@@ -121,7 +121,8 @@ class AmpliPiPlayerProvider(PlayerProvider):
     ):
         """Issue request to AmpliPi API."""
         url = f"http://{host}{path}"
-        if self._debug_enabled:
+        should_log_poll = not (method == "GET" and path == "/api")
+        if self._debug_enabled and should_log_poll:
             self.logger.debug("AmpliPi API request: %s %s payload=%s", method, path, payload or {})
         timeout = aiohttp.ClientTimeout(total=8)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -134,6 +135,13 @@ class AmpliPiPlayerProvider(PlayerProvider):
                     async with session.patch(url, json=payload or {}) as resp:
                         resp.raise_for_status()
                         data = await resp.json()
+                elif method == "DELETE":
+                    async with session.delete(url, json=payload or {}) as resp:
+                        resp.raise_for_status()
+                        if resp.content_type == "application/json":
+                            data = await resp.json()
+                        else:
+                            data = {"status": resp.status}
                 else:
                     async with session.post(url, json=payload or {}) as resp:
                         resp.raise_for_status()
@@ -143,7 +151,8 @@ class AmpliPiPlayerProvider(PlayerProvider):
                     self.logger.debug("AmpliPi API error: %s %s err=%s", method, path, err)
                 raise
 
-        if self._debug_enabled:
+        # Avoid very noisy logs for frequent polling calls.
+        if self._debug_enabled and should_log_poll:
             if isinstance(data, dict):
                 self.logger.debug("AmpliPi API response: %s %s keys=%s", method, path, sorted(data.keys()))
             else:
