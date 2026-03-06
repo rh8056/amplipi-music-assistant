@@ -105,12 +105,63 @@ class AmpliPiPlayerProvider(PlayerProvider):
                 play_vol_f=play_vol_f,
                 firmware_version=firmware_version,
             )
-            existing: MAPlayer | None = self.mass.players.get(player.player_id)
+            existing: MAPlayer | None = self.get_mass_player(player.player_id)
             if existing is None:
                 await self.mass.players.register(player)
             else:
-                existing.display_name = zone_name
+                # MA beta exposes display_name as cached/read-only; update base name attr instead.
+                if hasattr(existing, "_attr_name"):
+                    existing._attr_name = zone_name
                 existing.update_state()
+
+    def get_mass_player(self, player_id: str) -> MAPlayer | None:
+        """Return a player from MA PlayerController across API versions."""
+        controller = self.mass.players
+
+        getter = getattr(controller, "get", None)
+        if callable(getter):
+            return getter(player_id)
+
+        getter = getattr(controller, "get_player", None)
+        if callable(getter):
+            return getter(player_id)
+
+        getter = getattr(controller, "by_id", None)
+        if callable(getter):
+            return getter(player_id)
+
+        players_map = getattr(controller, "players", None)
+        if isinstance(players_map, dict):
+            return players_map.get(player_id)
+
+        return None
+
+    def get_all_mass_players(self) -> list[MAPlayer]:
+        """Return all players from MA PlayerController across API versions."""
+        controller = self.mass.players
+
+        all_method = getattr(controller, "all", None)
+        if callable(all_method):
+            try:
+                return list(all_method(True, False))
+            except TypeError:
+                try:
+                    return list(all_method())
+                except Exception:  # noqa: BLE001
+                    pass
+
+        list_method = getattr(controller, "get_players", None)
+        if callable(list_method):
+            try:
+                return list(list_method())
+            except Exception:  # noqa: BLE001
+                pass
+
+        players_map = getattr(controller, "players", None)
+        if isinstance(players_map, dict):
+            return list(players_map.values())
+
+        return []
 
     async def _request(
         self,
