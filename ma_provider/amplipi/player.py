@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import re
 import time
@@ -49,6 +50,9 @@ class AmpliPiPlayer(Player):
         self._replay_guard_media_uri: str | None = None
         self._last_media_uri: str | None = None
         self._sync_leader: str | None = None
+        self._last_logged_playback_state: PlaybackState | None = None
+        # Enable queue-tail detection for replay guard handling at end-of-queue.
+        self._enable_queue_tail_detection: bool = True
 
         # group model: leader has group_members list including itself, followers have synced_to.
         self._attr_group_members = [player_id]
@@ -60,7 +64,6 @@ class AmpliPiPlayer(Player):
             model="AmpliPro",
             manufacturer="MicroNova",
             software_version=firmware_version,
-            ip_address=host,
         )
         self._attr_available = True
         self._attr_powered = True
@@ -71,6 +74,20 @@ class AmpliPiPlayer(Player):
             PlayerFeature.PAUSE,
             PlayerFeature.SET_MEMBERS,
         }
+        play_media_feature = getattr(PlayerFeature, "PLAY_MEDIA", None)
+        if play_media_feature is not None:
+            self._attr_supported_features.add(play_media_feature)
+
+        # MA beta expects players to advertise at least one output protocol/format.
+        # Populate commonly used attribute names for cross-version compatibility.
+        for attr_name, value in (
+            ("_attr_supported_output_protocols", {"http", "https"}),
+            ("_attr_output_protocols", {"http", "https"}),
+            ("_attr_supported_output_formats", {"http"}),
+            ("_attr_output_formats", {"http"}),
+        ):
+            if hasattr(self, attr_name):
+                setattr(self, attr_name, value)
         self._attr_elapsed_time = 0
         self._attr_elapsed_time_last_updated = time.time()
 
@@ -79,9 +96,15 @@ class AmpliPiPlayer(Player):
         """Return sync leader player id if this player is grouped as follower."""
         return self._sync_leader
 
-    def _log_debug(self, msg: str, *args: Any) -> None:
+    def _log_debug(self, msg: str, *args: Any, **kwargs: Any) -> None:
         if self.provider.logger.isEnabledFor(logging.DEBUG):
-            self.provider.logger.debug("[zone=%s name=%s] " + msg, self.zone_id, self.zone_name, *args)
+            self.provider.logger.debug(
+                "[zone=%s name=%s] " + msg,
+                self.zone_id,
+                self.zone_name,
+                *args,
+                **kwargs,
+            )
 
     def _log_action(self, action: str, **kwargs: Any) -> None:
         """Log high-signal action breadcrumbs for playback debugging."""
@@ -111,7 +134,7 @@ class AmpliPiPlayer(Player):
     @property
     def poll_interval(self) -> int:
         """Return polling interval in seconds."""
-        return 1
+        return 1 if self._attr_playback_state == PlaybackState.PLAYING else 30
 
     @staticmethod
     def _parse_stream_id(source_input: str | None) -> int:
@@ -129,6 +152,9 @@ class AmpliPiPlayer(Player):
 
     def _queue_tail_reached(self) -> bool:
         """Best-effort signal that current queue item is at/near end and no next item exists."""
+        if not self._enable_queue_tail_detection:
+            return False
+
         try:
             queue = self.mass.player_queues.get(self.player_id)
         except Exception:  # noqa: BLE001
@@ -151,6 +177,48 @@ class AmpliPiPlayer(Player):
 
         # tolerate small timing jitter at track tail
         return elapsed >= (duration - 1.0)
+
+    async def _resolve_playable_uri(self, media: PlayerMedia) -> str:
+        """Resolve a directly playable URI for AmpliPi.
+
+        MA beta may pass library:// style identifiers to play_media. Try to
+        resolve these via stream helpers when available.
+        """
+        uri = getattr(media, "uri", None) or ""
+
+        # Prefer any explicitly provided direct URL-like attributes.
+        for attr_name in ("url", "stream_url", "direct_url"):
+            candidate = getattr(media, attr_name, None)
+            if isinstance(candidate, str) and candidate.startswith(("http://", "https://")):
+                return candidate
+
+        if isinstance(uri, str) and uri.startswith(("http://", "https://")):
+            return uri
+
+        streams_controller = getattr(self.mass, "streams", None)
+        if streams_controller is None:
+            return uri
+
+        for method_name in ("resolve_stream_url", "get_stream_url", "create_stream_url"):
+            method = getattr(streams_controller, method_name, None)
+            if not callable(method):
+                continue
+
+            for args in ((media,), (uri,), (self.player_id, media), (self.player_id, uri)):
+                try:
+                    result = method(*args)
+                    if inspect.isawaitable(result):
+                        result = await result
+                except TypeError:
+                    continue
+                except Exception as err:  # noqa: BLE001
+                    self._log_debug("play uri resolve failed method=%s args=%s err=%s", method_name, args, err)
+                    continue
+
+                if isinstance(result, str) and result:
+                    return result
+
+        return uri
 
     async def _set_zone(self, payload: dict[str, Any]) -> None:
         """Patch zone values with fallback to POST."""
@@ -186,7 +254,7 @@ class AmpliPiPlayer(Player):
         for member_id in self._attr_group_members:
             if member_id == self.player_id:
                 continue
-            member = self.mass.players.get(member_id)
+            member = self.provider.get_mass_player(member_id)
             if not isinstance(member, AmpliPiPlayer):
                 continue
             member._attr_playback_state = self._attr_playback_state
@@ -202,7 +270,7 @@ class AmpliPiPlayer(Player):
         for member_id in self._attr_group_members:
             if member_id == self.player_id:
                 continue
-            member = self.mass.players.get(member_id)
+            member = self.provider.get_mass_player(member_id)
             if isinstance(member, AmpliPiPlayer):
                 grouped_zone_ids.add(member.zone_id)
 
@@ -282,10 +350,28 @@ class AmpliPiPlayer(Player):
                 or []
             )
 
+        previous_source_id = self.last_source_id
         previous_stream_id = self.last_stream_id
         self.last_source_id = source_id
         self.last_stream_id = stream_id
         self.last_stream_supported_cmds = stream_supported_cmds
+
+        if previous_source_id != source_id:
+            self._log_debug(
+                "transport_source_change old=%s new=%s stream_id=%s state=%s",
+                previous_source_id,
+                source_id,
+                stream_id,
+                self._attr_playback_state,
+            )
+        if previous_stream_id != stream_id:
+            self._log_debug(
+                "transport_stream_change old=%s new=%s source_id=%s state=%s",
+                previous_stream_id,
+                stream_id,
+                source_id,
+                self._attr_playback_state,
+            )
 
         if previous_stream_id != stream_id:
             self._attr_elapsed_time = 0
@@ -293,6 +379,7 @@ class AmpliPiPlayer(Player):
             # New underlying stream context means prior track metadata/progress is stale.
             self._attr_current_media = None
 
+        prev_playback_state = self._attr_playback_state
         if not self._attr_powered:
             self._attr_playback_state = PlaybackState.IDLE
         elif source_id < 0:
@@ -304,8 +391,20 @@ class AmpliPiPlayer(Player):
         else:
             self._attr_playback_state = PlaybackState.IDLE
 
+        if self._attr_playback_state != prev_playback_state:
+            self._log_debug(
+                "playback_state_change old=%s new=%s source_state=%s source_id=%s stream_id=%s powered=%s",
+                prev_playback_state,
+                self._attr_playback_state,
+                source_state,
+                source_id,
+                stream_id,
+                self._attr_powered,
+            )
+
         # Keep elapsed timer sane for UI even when AmpliPi API lacks per-track progress.
         now = time.time()
+
         if self._attr_playback_state == PlaybackState.PLAYING:
             if self._attr_elapsed_time_last_updated:
                 self._attr_elapsed_time += max(0, now - self._attr_elapsed_time_last_updated)
@@ -414,7 +513,7 @@ class AmpliPiPlayer(Player):
 
         # Keep grouped follower UI in MA aligned with leader state/media.
         if self._sync_leader:
-            leader = self.mass.players.get(self._sync_leader)
+            leader = self.provider.get_mass_player(self._sync_leader)
             if isinstance(leader, AmpliPiPlayer):
                 self._attr_playback_state = leader.playback_state
                 self._attr_current_media = leader.current_media
@@ -429,7 +528,7 @@ class AmpliPiPlayer(Player):
             for member_id in self._attr_group_members:
                 if member_id == self.player_id:
                     continue
-                member = self.mass.players.get(member_id)
+                member = self.provider.get_mass_player(member_id)
                 if not isinstance(member, AmpliPiPlayer):
                     continue
                 if member.last_source_id != source_id or not member.powered:
@@ -457,7 +556,7 @@ class AmpliPiPlayer(Player):
         self._log_action("power", requested=powered, sync_leader=self._sync_leader)
         # If called on a synced child, delegate to leader for coherent group behavior.
         if self._sync_leader:
-            leader = self.mass.players.get(self._sync_leader)
+            leader = self.provider.get_mass_player(self._sync_leader)
             if isinstance(leader, AmpliPiPlayer):
                 self._log_debug("power(%s) delegated to leader=%s", powered, leader.player_id)
                 await leader.power(powered)
@@ -509,7 +608,7 @@ class AmpliPiPlayer(Player):
             # Build robust sibling set: explicit members, synced followers and
             # players currently sharing the same source.
             members: list[AmpliPiPlayer] = []
-            for mass_player in self.mass.players.all(True, False):
+            for mass_player in self.provider.get_all_mass_players():
                 if not isinstance(mass_player, AmpliPiPlayer):
                     continue
                 if mass_player.player_id == self.player_id:
@@ -536,7 +635,7 @@ class AmpliPiPlayer(Player):
                     for z in zones
                     if int(z.get("source_id", -1)) == self.last_source_id and int(z.get("id", -1)) >= 0
                 }
-                for mass_player in self.mass.players.all(True, False):
+                for mass_player in self.provider.get_all_mass_players():
                     if not isinstance(mass_player, AmpliPiPlayer):
                         continue
                     if mass_player.player_id == self.player_id:
@@ -584,6 +683,29 @@ class AmpliPiPlayer(Player):
             await self._set_zone({"mute": True})
             await asyncio.sleep(0.15)
             await self._set_zone({"source_id": -1})
+
+            # If no zones remain attached to the prior source, stop/delete backing stream
+            # so AmpliPi does not continue playback silently.
+            try:
+                if self.last_source_id >= 0 and self.last_stream_id >= 0:
+                    latest = await self.provider._request(self.host, "GET", "/api")
+                    zones_after = latest.get("zones", [])
+                    source_still_in_use = any(
+                        int(z.get("source_id", -1)) == self.last_source_id for z in zones_after
+                    )
+                    if not source_still_in_use:
+                        await self.provider._request(
+                            self.host,
+                            "DELETE",
+                            f"/api/streams/{self.last_stream_id}",
+                        )
+                        self._log_debug(
+                            "power(False) deleted stream_id=%s after last zone detached",
+                            self.last_stream_id,
+                        )
+            except Exception:
+                self._log_debug("power(False) failed stream cleanup", exc_info=True)
+
             self._attr_volume_muted = True
             self._attr_powered = False
             self._attr_playback_state = PlaybackState.IDLE
@@ -644,17 +766,6 @@ class AmpliPiPlayer(Player):
 
     async def stop(self) -> None:
         self._log_action("stop", stream_id=self.last_stream_id, source_id=self.last_source_id)
-        # If MA sends STOP shortly after PAUSE (e.g., idle timeout behavior),
-        # keep the zone paused and attached instead of hard power-off/detach.
-        if (
-            self._attr_playback_state == PlaybackState.PAUSED
-            and (time.time() - self._last_pause_cmd_ts) < 60.0
-        ):
-            self._log_debug("stop() ignored due to recent pause grace window")
-            self.update_state()
-            self._sync_child_states_from_leader()
-            return
-
         # Syncgroup virtual player power-off often routes as STOP to child players,
         # not POWER(False). Mirror shutdown behavior here so all linked zones detach.
         self._log_debug("stop() invoked; applying group-aware mute+detach behavior")
@@ -688,7 +799,7 @@ class AmpliPiPlayer(Player):
         # MA may call SET_MEMBERS on any involved player. If this player is currently
         # a synced child, delegate to leader to avoid split-brain group state.
         if self._sync_leader:
-            leader = self.mass.players.get(self._sync_leader)
+            leader = self.provider.get_mass_player(self._sync_leader)
             if isinstance(leader, AmpliPiPlayer):
                 await leader.set_members(player_ids_to_add, player_ids_to_remove)
             return
@@ -700,7 +811,7 @@ class AmpliPiPlayer(Player):
         for player_id in player_ids_to_add or []:
             if player_id == self.player_id:
                 continue
-            member = self.mass.players.get(player_id)
+            member = self.provider.get_mass_player(player_id)
             if not isinstance(member, AmpliPiPlayer):
                 continue
             await member._set_zone(
@@ -717,7 +828,7 @@ class AmpliPiPlayer(Player):
 
         # remove members from this leader
         for player_id in player_ids_to_remove or []:
-            member = self.mass.players.get(player_id)
+            member = self.provider.get_mass_player(player_id)
             if isinstance(member, AmpliPiPlayer):
                 member._sync_leader = None
                 # Explicit ungroup from this leader: detach the member from this source
@@ -738,15 +849,21 @@ class AmpliPiPlayer(Player):
 
     async def play_media(self, media: PlayerMedia) -> None:
         """Play media URL/path on selected AmpliPi source."""
-        self._log_action("play_media_start", uri=media.uri, sync_leader=self._sync_leader)
+        resolved_media_uri = await self._resolve_playable_uri(media)
+        self._log_action(
+            "play_media_start",
+            uri=media.uri,
+            resolved_uri=resolved_media_uri,
+            sync_leader=self._sync_leader,
+        )
         self._last_play_media_start_ts = time.time()
         self._replay_guard_started_ts = 0.0
         self._replay_guard_media_uri = None
-        self._last_media_uri = media.uri
+        self._last_media_uri = resolved_media_uri or media.uri
         # If play is invoked on a synced child, route to leader so grouped zones
         # are handled coherently.
         if self._sync_leader:
-            leader = self.mass.players.get(self._sync_leader)
+            leader = self.provider.get_mass_player(self._sync_leader)
             if isinstance(leader, AmpliPiPlayer):
                 await leader.play_media(media)
             return
@@ -765,7 +882,7 @@ class AmpliPiPlayer(Player):
             preferred_source_id=self.preferred_source_id,
         )
         play_payload = {
-            "media": media.uri,
+            "media": resolved_media_uri,
             "source_id": selected_source_id,
         }
         # Apply startup volume only when beginning a fresh session on this zone/source.
@@ -784,7 +901,7 @@ class AmpliPiPlayer(Player):
         for member_id in self._attr_group_members:
             if member_id == self.player_id:
                 continue
-            member = self.mass.players.get(member_id)
+            member = self.provider.get_mass_player(member_id)
             if not isinstance(member, AmpliPiPlayer):
                 continue
             await member._set_zone({"source_id": selected_source_id, "mute": False})
