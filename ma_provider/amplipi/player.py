@@ -53,6 +53,12 @@ class AmpliPiPlayer(Player):
         self._last_logged_playback_state: PlaybackState | None = None
         # Enable queue-tail detection for replay guard handling at end-of-queue.
         self._enable_queue_tail_detection: bool = True
+        self._announce_source_active: bool = False
+        self._resume_after_announce: bool = False
+        self._announce_snapshot_valid: bool = False
+        self._announce_snapshot_index: int | None = None
+        self._announce_snapshot_item_id: str | None = None
+        self._announce_snapshot_elapsed: float = 0.0
 
         # group model: leader has group_members list including itself, followers have synced_to.
         self._attr_group_members = [player_id]
@@ -249,6 +255,60 @@ class AmpliPiPlayer(Player):
             await asyncio.sleep(delay_seconds)
         return False
 
+    async def _queue_cmd(self, method_name: str, *args: Any) -> bool:
+        """Call a queue controller method if available."""
+        controller = getattr(self.mass, "player_queues", None)
+        if controller is None:
+            return False
+        method = getattr(controller, method_name, None)
+        if not callable(method):
+            return False
+        try:
+            result = method(*args)
+            if inspect.isawaitable(result):
+                await result
+            return True
+        except Exception as err:  # noqa: BLE001
+            self._log_debug("announce queue cmd failed method=%s args=%s err=%s", method_name, args, err)
+            return False
+
+    async def _restore_seek_position(self, position: float) -> bool:
+        """Seek to captured position with duration clamping when possible."""
+        seek_pos = max(0, int(position))
+        try:
+            if queue := self.mass.player_queues.get(self.player_id):
+                current_item = getattr(queue, "current_item", None)
+                duration = float(getattr(current_item, "duration", 0) or 0)
+                if duration > 2:
+                    seek_pos = min(seek_pos, max(0, int(duration - 1)))
+        except Exception:  # noqa: BLE001
+            pass
+
+        self._log_debug("announce_restore_seek_target requested=%.1f clamped=%s", position, seek_pos)
+        for method_name in ("seek", "set_seek_position", "cmd_seek"):
+            if await self._queue_cmd(method_name, self.player_id, seek_pos):
+                return True
+
+        players_controller = getattr(self.mass, "players", None)
+        if players_controller is not None:
+            for method_name in ("cmd_seek", "seek", "player_seek"):
+                method = getattr(players_controller, method_name, None)
+                if not callable(method):
+                    continue
+                try:
+                    result = method(self.player_id, seek_pos)
+                    if inspect.isawaitable(result):
+                        await result
+                    return True
+                except Exception as err:  # noqa: BLE001
+                    self._log_debug(
+                        "announce player seek failed method=%s pos=%s err=%s",
+                        method_name,
+                        seek_pos,
+                        err,
+                    )
+        return False
+
     def _sync_child_states_from_leader(self) -> None:
         """Mirror leader playback/media state onto grouped children in MA."""
         for member_id in self._attr_group_members:
@@ -342,6 +402,8 @@ class AmpliPiPlayer(Player):
         self._attr_powered = source_id >= 0 and not bool(zone.get("disabled", False))
 
         stream_id = self._parse_stream_id(source_input)
+        source_name = str(((src or {}).get("info") or {}).get("name") or "") if source_id >= 0 else ""
+        is_announce_source = source_name.lower().startswith("announcement")
         if stream_id >= 0:
             stream = next((s for s in data.get("streams", []) if int(s.get("id", -1)) == stream_id), None)
             stream_supported_cmds = (
@@ -349,6 +411,12 @@ class AmpliPiPlayer(Player):
                 or (stream or {}).get("stream_cmds", [])
                 or []
             )
+            stream_name = str((stream or {}).get("name") or "")
+            stream_type = str((stream or {}).get("type") or "")
+            if not is_announce_source and (
+                stream_name.lower().startswith("announcement") or stream_type.lower() == "announcement"
+            ):
+                is_announce_source = True
 
         previous_source_id = self.last_source_id
         previous_stream_id = self.last_stream_id
@@ -401,6 +469,103 @@ class AmpliPiPlayer(Player):
                 stream_id,
                 self._attr_powered,
             )
+
+        # Authoritative announce detection from /api source/stream metadata.
+        if is_announce_source and not self._announce_source_active:
+            was_playing = prev_playback_state == PlaybackState.PLAYING
+            self._resume_after_announce = was_playing
+            self._announce_snapshot_valid = False
+            self._announce_snapshot_index = None
+            self._announce_snapshot_item_id = None
+            self._announce_snapshot_elapsed = float(self._attr_elapsed_time or 0)
+            try:
+                if queue := self.mass.player_queues.get(self.player_id):
+                    idx = getattr(queue, "current_index", None)
+                    self._announce_snapshot_index = int(idx) if isinstance(idx, int) else None
+                    current_item = getattr(queue, "current_item", None)
+                    self._announce_snapshot_item_id = getattr(current_item, "queue_item_id", None) or getattr(
+                        current_item, "item_id", None
+                    )
+                    self._announce_snapshot_elapsed = float(
+                        getattr(queue, "elapsed_time", self._announce_snapshot_elapsed) or self._announce_snapshot_elapsed
+                    )
+                    self._announce_snapshot_valid = True
+            except Exception:  # noqa: BLE001
+                self._announce_snapshot_valid = False
+            self._log_debug(
+                "announce_state_entered source_id=%s stream_id=%s source_name=%s was_playing=%s",
+                source_id,
+                stream_id,
+                source_name,
+                was_playing,
+            )
+            self._log_debug(
+                "announce_snapshot_captured valid=%s index=%s item_id=%s elapsed=%.1f",
+                self._announce_snapshot_valid,
+                self._announce_snapshot_index,
+                self._announce_snapshot_item_id,
+                self._announce_snapshot_elapsed,
+            )
+
+        if not is_announce_source and self._announce_source_active:
+            resume_requested = self._resume_after_announce
+            self._log_debug(
+                "announce_state_exited source_id=%s stream_id=%s source_name=%s resume_requested=%s",
+                source_id,
+                stream_id,
+                source_name,
+                resume_requested,
+            )
+            self._resume_after_announce = False
+            if resume_requested:
+                restored_index = False
+                if self._announce_snapshot_valid and self._announce_snapshot_index is not None:
+                    current_idx = None
+                    try:
+                        if queue := self.mass.player_queues.get(self.player_id):
+                            idx = getattr(queue, "current_index", None)
+                            current_idx = int(idx) if isinstance(idx, int) else None
+                    except Exception:  # noqa: BLE001
+                        current_idx = None
+
+                    if current_idx != self._announce_snapshot_index:
+                        self._log_debug(
+                            "announce_restore_index_needed current_index=%s target_index=%s",
+                            current_idx,
+                            self._announce_snapshot_index,
+                        )
+                        for method_name in ("play_index", "set_current_index", "set_index"):
+                            if await self._queue_cmd(method_name, self.player_id, self._announce_snapshot_index):
+                                restored_index = True
+                                break
+                        self._log_debug(
+                            "announce_restore_index_%s target_index=%s",
+                            "applied" if restored_index else "failed",
+                            self._announce_snapshot_index,
+                        )
+                    else:
+                        restored_index = True
+                        self._log_debug("announce_restore_index_already_current index=%s", current_idx)
+
+                seek_applied = False
+                if self._announce_snapshot_valid and self._announce_snapshot_elapsed > 2:
+                    seek_applied = await self._restore_seek_position(self._announce_snapshot_elapsed)
+                    self._log_debug(
+                        "announce_restore_seek_%s elapsed=%.1f",
+                        "applied" if seek_applied else "failed",
+                        self._announce_snapshot_elapsed,
+                    )
+
+                if not restored_index and not seek_applied:
+                    self._log_debug("announce_restore_fallback_play")
+                    await self.play()
+
+            self._announce_snapshot_valid = False
+            self._announce_snapshot_index = None
+            self._announce_snapshot_item_id = None
+            self._announce_snapshot_elapsed = 0.0
+
+        self._announce_source_active = is_announce_source
 
         # Keep elapsed timer sane for UI even when AmpliPi API lacks per-track progress.
         now = time.time()
@@ -694,15 +859,25 @@ class AmpliPiPlayer(Player):
                         int(z.get("source_id", -1)) == self.last_source_id for z in zones_after
                     )
                     if not source_still_in_use:
-                        await self.provider._request(
-                            self.host,
-                            "DELETE",
-                            f"/api/streams/{self.last_stream_id}",
-                        )
-                        self._log_debug(
-                            "power(False) deleted stream_id=%s after last zone detached",
-                            self.last_stream_id,
-                        )
+                        try:
+                            await self.provider._request(
+                                self.host,
+                                "DELETE",
+                                f"/api/streams/{self.last_stream_id}",
+                            )
+                            self._log_debug(
+                                "power(False) deleted stream_id=%s after last zone detached",
+                                self.last_stream_id,
+                            )
+                        except Exception as err:  # noqa: BLE001
+                            # Stream can already be gone due to concurrent cleanup; ignore 404.
+                            if getattr(err, "status", None) == 404:
+                                self._log_debug(
+                                    "power(False) stream cleanup skipped: stream_id=%s already removed",
+                                    self.last_stream_id,
+                                )
+                            else:
+                                raise
             except Exception:
                 self._log_debug("power(False) failed stream cleanup", exc_info=True)
 
