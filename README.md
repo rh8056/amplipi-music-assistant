@@ -150,13 +150,20 @@ Current source pick order is:
 
 ### `play_vol_f`
 
-Startup play volume (0.0 to 1.0).
+Startup play volume (0.0 to 1.0). This is only used if a prior volume for the zone/ source is not found. The intent is to start at a slightly lower volume.
 
 Good starting value: `0.2` to `0.35`.
 
-### `debug_logs`
+### Debug logging
 
-Turn this on only when troubleshooting.
+Use Music Assistant/server log level (`DEBUG`) when troubleshooting this provider.
+
+Recent provider builds include announce-specific debug markers such as:
+- `announce_state_entered ...`
+- `announce_snapshot_captured ...`
+- `announce_state_exited ...`
+- `announce_restore_index_*`
+- `announce_restore_seek_*`
 
 ---
 
@@ -183,6 +190,8 @@ Zones are:
 2. detached from source
 
 No zone is disabled by MA.
+
+If the backing stream is already gone, stream cleanup may return HTTP 404 internally and is treated as expected.
 
 ### Power On a zone
 
@@ -253,7 +262,33 @@ Fix:
 
 ---
 
-## 10) Optional Home Assistant integration
+## 10) Known limitations
+
+These are current practical limitations to be aware of:
+
+1. **Music Assistant native Announce is not reliable with AmpliPi right now**
+   - In some flows it can re-trigger playback unexpectedly/loop.
+   - Recommendation: avoid MA native announce for now with this provider.
+
+2. **AmpliPi native `/announce` is usable, but MA transport/UI can drift**
+   - Audio may continue correctly, while MA progress/track UI can temporarily be out of sync.
+   - Provider attempts queue snapshot/restore, but edge cases still exist.
+
+3. **Transport state is inferred from AmpliPi source state**
+   - AmpliPi does not expose perfect per-track transport semantics for all flows.
+   - During rapid stream swaps, MA UI state may lag behind actual audio for short periods.
+
+4. **Source selection remains heuristic-based**
+   - Provider tries to avoid stealing sources used by other zones, but when all sources are busy,
+     fallback selection may still not match every household routing preference.
+
+5. **Power-off stream cleanup races are possible**
+   - Stream objects may already be removed by the time cleanup runs; this can produce benign 404
+     cleanup conditions (handled as expected by current provider builds).
+
+---
+
+## 11) Optional Home Assistant integration
 
 If you want HA-side entities too, there is an optional custom integration at:
 
