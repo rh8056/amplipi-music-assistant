@@ -49,6 +49,9 @@ class AmpliPiPlayer(Player):
         self._replay_guard_started_ts: float = 0.0
         self._replay_guard_media_uri: str | None = None
         self._last_media_uri: str | None = None
+        self._pending_media: PlayerMedia | None = None
+        self._pending_media_source_id: int = -1
+        self._pending_media_until: float = 0.0
         self._sync_leader: str | None = None
         self._last_logged_playback_state: PlaybackState | None = None
         # Enable queue-tail detection for replay guard handling at end-of-queue.
@@ -140,7 +143,10 @@ class AmpliPiPlayer(Player):
     @property
     def poll_interval(self) -> int:
         """Return polling interval in seconds."""
-        return 1 if self._attr_playback_state == PlaybackState.PLAYING else 30
+        return 1 if (
+            self._attr_playback_state == PlaybackState.PLAYING
+            or time.monotonic() < self._pending_media_until
+        ) else 30
 
     @staticmethod
     def _parse_stream_id(source_input: str | None) -> int:
@@ -394,7 +400,8 @@ class AmpliPiPlayer(Player):
         stream_supported_cmds: list[str] = []
         if source_id >= 0:
             src = next((s for s in sources if int(s.get("id", -1)) == source_id), None)
-            source_state = str((src or {}).get("info", {}).get("state", "stopped")).lower()
+            source_info = (src or {}).get("info") or {}
+            source_state = str(source_info.get("state", "stopped")).lower()
             source_input = (src or {}).get("input")
 
         # MA power model: zone is considered powered when attached to an active source.
@@ -402,7 +409,7 @@ class AmpliPiPlayer(Player):
         self._attr_powered = source_id >= 0 and not bool(zone.get("disabled", False))
 
         stream_id = self._parse_stream_id(source_input)
-        source_name = str(((src or {}).get("info") or {}).get("name") or "") if source_id >= 0 else ""
+        source_name = str(source_info.get("name") or "") if source_id >= 0 else ""
         is_announce_source = source_name.lower().startswith("announcement")
         if stream_id >= 0:
             stream = next((s for s in data.get("streams", []) if int(s.get("id", -1)) == stream_id), None)
@@ -444,8 +451,30 @@ class AmpliPiPlayer(Player):
         if previous_stream_id != stream_id:
             self._attr_elapsed_time = 0
             self._attr_elapsed_time_last_updated = time.time()
-            # New underlying stream context means prior track metadata/progress is stale.
+            # /api/play can assign its new stream after the first poll. Keep the
+            # MA queue item through that handoff, but discard it for an unrelated
+            # stream change (including one started outside Music Assistant).
+            if (
+                self._pending_media is not None
+                and source_id == self._pending_media_source_id
+                and time.monotonic() < self._pending_media_until
+            ):
+                self._attr_current_media = self._pending_media
+            else:
+                self._attr_current_media = None
+                self._last_media_uri = None
+
+        if source_id < 0 or not self._attr_powered:
             self._attr_current_media = None
+            self._attr_active_source = None
+            self._pending_media = None
+            self._pending_media_source_id = -1
+            self._pending_media_until = 0.0
+            self._last_media_uri = None
+        elif self._attr_current_media is not None:
+            self._attr_active_source = getattr(self._attr_current_media, "source_id", None)
+        else:
+            self._attr_active_source = None
 
         prev_playback_state = self._attr_playback_state
         if not self._attr_powered:
@@ -458,6 +487,24 @@ class AmpliPiPlayer(Player):
             self._attr_playback_state = PlaybackState.PAUSED
         else:
             self._attr_playback_state = PlaybackState.IDLE
+
+        if self._pending_media is not None and time.monotonic() >= self._pending_media_until:
+            if self._attr_playback_state == PlaybackState.IDLE:
+                self.provider.logger.warning(
+                    "AmpliPi zone %s did not report playback after /api/play "
+                    "(source=%s, state=%s, input=%s, stream=%s)",
+                    self.zone_id,
+                    source_id,
+                    source_state,
+                    source_input,
+                    stream_id,
+                )
+                self._attr_current_media = None
+                self._attr_active_source = None
+                self._last_media_uri = None
+            self._pending_media = None
+            self._pending_media_source_id = -1
+            self._pending_media_until = 0.0
 
         if self._attr_playback_state != prev_playback_state:
             self._log_debug(
@@ -509,6 +556,9 @@ class AmpliPiPlayer(Player):
 
         if not is_announce_source and self._announce_source_active:
             resume_requested = self._resume_after_announce
+            # Restoration can call play(), which polls again. Mark the exit
+            # before awaiting it so the nested poll cannot restore twice.
+            self._announce_source_active = False
             self._log_debug(
                 "announce_state_exited source_id=%s stream_id=%s source_name=%s resume_requested=%s",
                 source_id,
@@ -682,6 +732,7 @@ class AmpliPiPlayer(Player):
             if isinstance(leader, AmpliPiPlayer):
                 self._attr_playback_state = leader.playback_state
                 self._attr_current_media = leader.current_media
+                self._attr_active_source = leader.active_source
                 self._attr_elapsed_time = leader.elapsed_time
                 self._attr_elapsed_time_last_updated = leader.elapsed_time_last_updated
                 # avoid "Off" while source is active as part of grouped playback
@@ -919,11 +970,15 @@ class AmpliPiPlayer(Player):
         prev_elapsed = float(self._attr_elapsed_time or 0)
         await self._set_zone({"mute": False})
         await self._play_with_retry()
-        self._attr_playback_state = PlaybackState.PLAYING
+        await self.poll()
         # On resume-from-pause, preserve elapsed position for UI continuity.
-        if prev_state in (PlaybackState.PAUSED, PlaybackState.PLAYING) and prev_elapsed > 0:
+        if (
+            self._attr_playback_state == PlaybackState.PLAYING
+            and prev_state in (PlaybackState.PAUSED, PlaybackState.PLAYING)
+            and prev_elapsed > 0
+        ):
             self._attr_elapsed_time = prev_elapsed
-        else:
+        elif self._attr_playback_state == PlaybackState.PLAYING:
             self._attr_elapsed_time = 0
         self._attr_elapsed_time_last_updated = time.time()
         self.update_state()
@@ -1070,6 +1125,13 @@ class AmpliPiPlayer(Player):
             "/api/play",
             play_payload,
         )
+        # Keep the MA queue identity while AmpliPi creates/attaches its stream.
+        # A successful command is not proof that the source is playing yet.
+        self._pending_media = media
+        self._pending_media_source_id = selected_source_id
+        self._pending_media_until = time.monotonic() + 30.0
+        self._attr_current_media = media
+        self._attr_active_source = getattr(media, "source_id", None)
         await self._set_zone({"source_id": selected_source_id, "mute": False})
 
         # Ensure currently grouped members are explicitly attached to the same source.
@@ -1086,9 +1148,6 @@ class AmpliPiPlayer(Player):
 
         await self._play_with_retry()
         self._last_play_cmd_ts = time.time()
-        self._attr_current_media = media
-        self._attr_playback_state = PlaybackState.PLAYING
-        self._attr_elapsed_time = 0
-        self._attr_elapsed_time_last_updated = time.time()
+        await self.poll()
         self.update_state()
         self._sync_child_states_from_leader()
